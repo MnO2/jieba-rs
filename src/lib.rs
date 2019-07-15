@@ -247,9 +247,14 @@ impl Jieba {
 
         let patterns: Vec<&str> = records.iter().map(|n| n.0.as_ref()).collect();
         let total = records.iter().map(|n| n.1).sum();
-        let ac_standard = AhoCorasick::new(&patterns);
+        let ac_standard = AhoCorasickBuilder::new()
+            .match_kind(MatchKind::Standard)
+            .dfa(true)
+            .build(&patterns);
+
         let ac_leftmost_longest = AhoCorasickBuilder::new()
             .match_kind(MatchKind::LeftmostLongest)
+            .dfa(true)
             .build(&patterns);
 
         Jieba {
