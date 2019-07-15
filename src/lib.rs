@@ -72,7 +72,6 @@ use lazy_static::lazy_static;
 use std::cmp::Ordering;
 use std::io::{self, BufRead};
 
-use cedarwood::Cedar;
 use regex::{Match, Matches, Regex};
 use smallvec::SmallVec;
 
@@ -86,6 +85,8 @@ pub use crate::keywords::KeywordExtract;
 mod hmm;
 #[cfg(any(feature = "tfidf", feature = "textrank"))]
 mod keywords;
+
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 
 #[cfg(feature = "default-dict")]
 static DEFAULT_DICT: &str = include_str!("data/dict.txt");
@@ -198,7 +199,8 @@ pub struct Tag<'a> {
 #[derive(Debug, Clone)]
 pub struct Jieba {
     records: Vec<(String, usize, String)>,
-    cedar: Cedar,
+    ac_standard: AhoCorasick,
+    ac_leftmost_longest: AhoCorasick,
     total: usize,
     longest_word_len: usize,
 }
@@ -211,72 +213,17 @@ impl Default for Jieba {
 }
 
 impl Jieba {
-    /// Create a new instance with empty dict
-    pub fn empty() -> Self {
-        Jieba {
-            records: Vec::new(),
-            cedar: Cedar::new(),
-            total: 0,
-            longest_word_len: 0,
-        }
-    }
-
     /// Create a new instance with embed dict
     ///
     /// Requires `default-dict` feature to be enabled.
     #[cfg(feature = "default-dict")]
     pub fn new() -> Self {
-        let mut instance = Self::empty();
-        let mut default_dict = io::BufReader::new(DEFAULT_DICT.as_bytes());
-        instance.load_dict(&mut default_dict).unwrap();
-        instance
-    }
-
-    /// Create a new instance with dict
-    pub fn with_dict<R: BufRead>(dict: &mut R) -> io::Result<Self> {
-        let mut instance = Self::empty();
-        instance.load_dict(dict)?;
-        Ok(instance)
-    }
-    /// Add word to dict, return `freq`
-    ///
-    /// `freq`: if `None`, will be given by [suggest_freq](#method.suggest_freq)
-    ///
-    /// `tag`: if `None`, will be given `""`
-    pub fn add_word(&mut self, word: &str, freq: Option<usize>, tag: Option<&str>) -> usize {
-        let freq = freq.unwrap_or_else(|| self.suggest_freq(word));
-        let tag = tag.unwrap_or("");
-
-        match self.cedar.exact_match_search(word) {
-            Some((word_id, _, _)) => {
-                let old_freq = self.records[word_id as usize].1;
-                self.records[word_id as usize].1 = freq;
-                self.total += freq - old_freq;
-            }
-            None => {
-                self.records.push((String::from(word), freq, String::from(tag)));
-                let word_id = (self.records.len() - 1) as i32;
-
-                self.cedar.update(word, word_id);
-                self.total += freq;
-            }
-        };
-
-        let curr_word_len = word.chars().count();
-        if self.longest_word_len < curr_word_len {
-            self.longest_word_len = curr_word_len;
-        }
-
-        freq
-    }
-
-    /// Load dictionary
-    pub fn load_dict<R: BufRead>(&mut self, dict: &mut R) -> io::Result<()> {
+        let mut dict = io::BufReader::new(DEFAULT_DICT.as_bytes());
         let mut buf = String::new();
-        self.total = 0;
-        self.longest_word_len = 0;
+        let mut longest_word_len = 0;
+        let mut records = Vec::new();
 
-        while dict.read_line(&mut buf)? > 0 {
+        while dict.read_line(&mut buf).unwrap() > 0 {
             {
                 let parts: Vec<&str> = buf.trim().split_whitespace().collect();
                 if parts.is_empty() {
@@ -289,49 +236,42 @@ impl Jieba {
                 let tag = parts.get(2).cloned().unwrap_or("");
 
                 let curr_word_len = word.chars().count();
-                if self.longest_word_len < curr_word_len {
-                    self.longest_word_len = curr_word_len;
+                if longest_word_len < curr_word_len {
+                    longest_word_len = curr_word_len;
                 }
 
-                match self.cedar.exact_match_search(word) {
-                    Some((word_id, _, _)) => {
-                        self.records[word_id as usize].1 = freq;
-                    }
-                    None => {
-                        self.records.push((String::from(word), freq, String::from(tag)));
-                    }
-                };
+                records.push((String::from(word), freq, String::from(tag)));
             }
             buf.clear();
         }
 
-        let key_values: Vec<(&str, i32)> = self
-            .records
-            .iter()
-            .enumerate()
-            .map(|(k, n)| (n.0.as_ref(), k as i32))
-            .collect();
-        self.total = self.records.iter().map(|n| n.1).sum();
-        self.cedar = Cedar::new();
-        self.cedar.build(&key_values);
+        let patterns: Vec<&str> = records.iter().map(|n| n.0.as_ref()).collect();
+        let total = records.iter().map(|n| n.1).sum();
+        let ac_standard = AhoCorasick::new(&patterns);
+        let ac_leftmost_longest = AhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(&patterns);
 
-        Ok(())
-    }
-
-    fn get_word_freq(&self, word: &str, default: usize) -> usize {
-        match self.cedar.exact_match_search(word) {
-            Some((word_id, _, _)) => self.records[word_id as usize].1,
-            _ => default,
+        Jieba {
+            records: records,
+            ac_standard,
+            ac_leftmost_longest,
+            total,
+            longest_word_len: 0,
         }
     }
 
-    /// Suggest word frequency to force the characters in a word to be joined or splitted.
-    pub fn suggest_freq(&self, segment: &str) -> usize {
-        let logtotal = (self.total as f64).ln();
-        let logfreq = self.cut(segment, false).iter().fold(0f64, |freq, word| {
-            freq + (self.get_word_freq(word, 1) as f64).ln() - logtotal
-        });
-        std::cmp::max((logfreq + logtotal).exp() as usize + 1, self.get_word_freq(segment, 1))
+    #[inline]
+    fn exact_match_search(&self, haystack: &str) -> Option<usize> {
+        if let Some(mat) = self.ac_leftmost_longest.find(haystack) {
+            if haystack.len() == mat.end() {
+                Some(mat.pattern())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 
     #[allow(clippy::ptr_arg)]
@@ -355,8 +295,8 @@ impl Jieba {
                         &sentence[byte_start..byte_end]
                     };
 
-                    let freq = if let Some((word_id, _, _)) = self.cedar.exact_match_search(wfrag) {
-                        self.records[word_id as usize].1
+                    let freq = if let Some(word_id) = self.exact_match_search(wfrag) {
+                        self.records[word_id].1
                     } else {
                         1
                     };
@@ -384,18 +324,8 @@ impl Jieba {
             dag.resize(str_len, SmallVec::new());
         }
 
-        let mut iter = sentence.char_indices().peekable();
-        while let Some((byte_start, _)) = iter.next() {
-            let mut tmplist = SmallVec::new();
-            let haystack = &sentence[byte_start..];
-
-            for (_, end_index) in self.cedar.common_prefix_iter(haystack) {
-                tmplist.push(end_index + byte_start + 1);
-            }
-
-            if !tmplist.is_empty() {
-                dag[byte_start] = tmplist;
-            }
+        for mat in self.ac_standard.find_overlapping_iter(sentence) {
+            dag[mat.start()].push(mat.end());
         }
     }
 
@@ -503,7 +433,7 @@ impl Jieba {
 
                     if word.chars().count() == 1 {
                         words.push(word);
-                    } else if self.cedar.exact_match_search(word).is_none() {
+                    } else if self.exact_match_search(word).is_none() {
                         hmm::cut_with_allocated_memory(word, words, V, prev, path);
                     } else {
                         let mut word_indices = word.char_indices().map(|x| x.0).peekable();
@@ -532,7 +462,7 @@ impl Jieba {
 
             if word.chars().count() == 1 {
                 words.push(word);
-            } else if self.cedar.exact_match_search(word).is_none() {
+            } else if self.exact_match_search(word).is_none() {
                 hmm::cut(word, words);
             } else {
                 let mut word_indices = word.char_indices().map(|x| x.0).peekable();
@@ -650,7 +580,7 @@ impl Jieba {
                     } else {
                         &word[byte_start..]
                     };
-                    if self.cedar.exact_match_search(gram2).is_some() {
+                    if self.exact_match_search(gram2).is_some() {
                         new_words.push(gram2);
                     }
                 }
@@ -663,7 +593,7 @@ impl Jieba {
                     } else {
                         &word[byte_start..]
                     };
-                    if self.cedar.exact_match_search(gram3).is_some() {
+                    if self.exact_match_search(gram3).is_some() {
                         new_words.push(gram3);
                     }
                 }
@@ -710,7 +640,7 @@ impl Jieba {
                             } else {
                                 &word[byte_start..]
                             };
-                            if self.cedar.exact_match_search(gram2).is_some() {
+                            if self.exact_match_search(gram2).is_some() {
                                 tokens.push(Token {
                                     word: gram2,
                                     start: start + i,
@@ -726,7 +656,7 @@ impl Jieba {
                                 } else {
                                     &word[byte_start..]
                                 };
-                                if self.cedar.exact_match_search(gram3).is_some() {
+                                if self.exact_match_search(gram3).is_some() {
                                     tokens.push(Token {
                                         word: gram3,
                                         start: start + i,
@@ -760,8 +690,8 @@ impl Jieba {
         words
             .into_iter()
             .map(|word| {
-                if let Some((word_id, _, _)) = self.cedar.exact_match_search(word) {
-                    let t = &self.records[word_id as usize].2;
+                if let Some(word_id) = self.exact_match_search(word) {
+                    let t = &self.records[word_id].2;
                     return Tag { word, tag: t };
                 }
                 let mut eng = 0;
@@ -791,7 +721,6 @@ impl Jieba {
 mod tests {
     use super::{Jieba, SplitMatches, SplitState, Tag, Token, TokenizeMode, DAG, RE_HAN_DEFAULT};
     use smallvec::SmallVec;
-    use std::io::BufReader;
 
     #[test]
     fn test_init_with_default_dict() {
@@ -1249,181 +1178,5 @@ mod tests {
                 }
             ]
         );
-    }
-
-    #[test]
-    fn test_userdict() {
-        let mut jieba = Jieba::new();
-        let tokens = jieba.tokenize("我们中出了一个叛徒", TokenizeMode::Default, false);
-        assert_eq!(
-            tokens,
-            vec![
-                Token {
-                    word: "我们",
-                    start: 0,
-                    end: 2
-                },
-                Token {
-                    word: "中",
-                    start: 2,
-                    end: 3
-                },
-                Token {
-                    word: "出",
-                    start: 3,
-                    end: 4
-                },
-                Token {
-                    word: "了",
-                    start: 4,
-                    end: 5
-                },
-                Token {
-                    word: "一个",
-                    start: 5,
-                    end: 7
-                },
-                Token {
-                    word: "叛徒",
-                    start: 7,
-                    end: 9
-                }
-            ]
-        );
-        let userdict = "中出 10000";
-        jieba.load_dict(&mut BufReader::new(userdict.as_bytes())).unwrap();
-        let tokens = jieba.tokenize("我们中出了一个叛徒", TokenizeMode::Default, false);
-        assert_eq!(
-            tokens,
-            vec![
-                Token {
-                    word: "我们",
-                    start: 0,
-                    end: 2
-                },
-                Token {
-                    word: "中出",
-                    start: 2,
-                    end: 4
-                },
-                Token {
-                    word: "了",
-                    start: 4,
-                    end: 5
-                },
-                Token {
-                    word: "一个",
-                    start: 5,
-                    end: 7
-                },
-                Token {
-                    word: "叛徒",
-                    start: 7,
-                    end: 9
-                }
-            ]
-        );
-    }
-
-    #[test]
-    fn test_userdict_hmm() {
-        let mut jieba = Jieba::new();
-        let tokens = jieba.tokenize("我们中出了一个叛徒", TokenizeMode::Default, true);
-        assert_eq!(
-            tokens,
-            vec![
-                Token {
-                    word: "我们",
-                    start: 0,
-                    end: 2
-                },
-                Token {
-                    word: "中出",
-                    start: 2,
-                    end: 4
-                },
-                Token {
-                    word: "了",
-                    start: 4,
-                    end: 5
-                },
-                Token {
-                    word: "一个",
-                    start: 5,
-                    end: 7
-                },
-                Token {
-                    word: "叛徒",
-                    start: 7,
-                    end: 9
-                }
-            ]
-        );
-        let userdict = "出了 10000";
-        jieba.load_dict(&mut BufReader::new(userdict.as_bytes())).unwrap();
-        let tokens = jieba.tokenize("我们中出了一个叛徒", TokenizeMode::Default, true);
-        assert_eq!(
-            tokens,
-            vec![
-                Token {
-                    word: "我们",
-                    start: 0,
-                    end: 2
-                },
-                Token {
-                    word: "中",
-                    start: 2,
-                    end: 3
-                },
-                Token {
-                    word: "出了",
-                    start: 3,
-                    end: 5
-                },
-                Token {
-                    word: "一个",
-                    start: 5,
-                    end: 7
-                },
-                Token {
-                    word: "叛徒",
-                    start: 7,
-                    end: 9
-                }
-            ]
-        );
-    }
-
-    #[test]
-    fn test_suggest_freq() {
-        // NOTE: Following behaviors are aligned with original Jieba
-
-        let mut jieba = Jieba::new();
-        // These values were calculated by original Jieba
-        assert_eq!(jieba.suggest_freq("中出"), 348);
-        assert_eq!(jieba.suggest_freq("出了"), 1263);
-
-        // Freq in dict.txt was 3, which became 300 after loading user dict
-        let userdict = "中出 300";
-        jieba.load_dict(&mut BufReader::new(userdict.as_bytes())).unwrap();
-        // But it's less than calculated freq 348
-        assert_eq!(jieba.suggest_freq("中出"), 348);
-
-        let userdict = "中出 500";
-        jieba.load_dict(&mut BufReader::new(userdict.as_bytes())).unwrap();
-        // Now it's significant enough
-        assert_eq!(jieba.suggest_freq("中出"), 500)
-    }
-
-    #[test]
-    fn test_cut_dag_no_hmm_against_string_with_sip() {
-        let mut jieba = Jieba::empty();
-
-        //add fake word into dictionary
-        jieba.add_word("䶴䶵𦡦", Some(1000), None);
-        jieba.add_word("讥䶯䶰䶱䶲䶳", Some(1000), None);
-
-        let words = jieba.cut("讥䶯䶰䶱䶲䶳䶴䶵𦡦", false);
-        assert_eq!(words, vec!["讥䶯䶰䶱䶲䶳", "䶴䶵𦡦"]);
     }
 }
